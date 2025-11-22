@@ -1,0 +1,288 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  prepare-matrix:
+    name: Prepare matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Read Postgres image version from compose
+        id: set-matrix
+        run: |
+          # Default service name used in this repo
+          svc=Postgres
+
+          # Find the 'image:' line near the Postgres service
+          lineno=$(grep -n "^[[:space:]]*$svc:" docker-compose.yml | head -n1 | cut -d: -f1 || true)
+          image=""
+          if [ -n "$lineno" ]; then
+            # inspect a few lines after the service name for image
+            image=$(sed -n "$((lineno+1)),$((lineno+6))p" docker-compose.yml | sed -n 's/^[[:space:]]*image:[[:space:]]*//p' | head -n1)
+          fi
+
+          # Fallback if parsing failed
+          image=${image:-postgres:16}
+
+          # Extract the tag portion (after colon) and then the major number
+          tag=${image#*:}
+          major=$(echo "$tag" | sed -E 's/^([0-9]+).*/\1/')
+          if ! echo "$major" | grep -E '^[0-9]+$' >/dev/null 2>&1; then
+            echo "Could not parse major version from image '$image'" >&2
+            exit 1
+          fi
+
+          # Build an array of the previous 4 major versions
+          versions=()
+          for i in 1 2 3 4; do
+            v=$((major - i))
+            versions+=("$v")
+          done
+
+          # JSON-encode the versions for the matrix
+          json=$(printf '"%s",' "${versions[@]}" | sed 's/,$//')
+          json="[${json}]"
+
+          echo "Detected Postgres major version: $major (image: $image)"
+          echo "Matrix versions: $json"
+          echo "matrix=$json" >> $GITHUB_OUTPUT
+
+  test-matrix:
+    name: Test Postgres matrix
+    needs: prepare-matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        pg_version: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Copy env file for Docker Compose
+        run: cp postgres.env.example ./.postgres.env.example
+
+      - name: Create compose override for Postgres version
+        run: |
+          cat > compose.override.yml <<EOF
+          services:
+            Postgres:
+              image: postgres:${{ matrix.pg_version }}
+          EOF
+
+      - name: Start services with Docker Compose (matrix)
+        run: |
+          docker compose -f docker-compose.yml -f compose.override.yml up -d --build
+
+      - name: Detect Postgres service
+        id: detect_service
+        run: |
+          set -o allexport
+          source ./.postgres.env.example || true
+          set +o allexport
+
+          PG_SERVICE="${PG_SERVICE:-Postgres}"
+
+          if [ -n "$(docker compose ps -q "$PG_SERVICE")" ]; then
+            echo "Using configured service: $PG_SERVICE"
+            echo "PG_SERVICE=$PG_SERVICE" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          for s in $(docker compose ps --services); do
+            echo "Probing service: $s"
+            if docker compose exec -T "$s" pg_isready -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-postgres}" >/dev/null 2>&1; then
+              PG_SERVICE="$s"
+              echo "Auto-detected Postgres service: $PG_SERVICE"
+              echo "PG_SERVICE=$PG_SERVICE" >> $GITHUB_ENV
+              exit 0
+            fi
+          done
+
+          echo "Could not detect a Postgres service via docker compose." >&2
+          docker compose ps || true
+          exit 1
+
+      - name: Wait for Postgres readiness
+        run: |
+          set -o allexport
+          source ./.postgres.env.example || true
+          set +o allexport
+          echo "Waiting for Postgres (service: $PG_SERVICE) to be ready..."
+          for i in $(seq 1 60); do
+            if docker compose exec -T "$PG_SERVICE" pg_isready -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-postgres}" >/dev/null 2>&1; then
+              echo "Postgres is ready (attempt $i)."
+              exit 0
+            fi
+            echo "Not ready yet (attempt $i)..."
+            sleep 2
+          done
+          echo "Postgres did not become ready in time." >&2
+          docker compose logs "$PG_SERVICE" || true
+          exit 1
+
+      - name: Detect host port for Postgres
+        run: |
+          MAPPING=$(docker compose -f docker-compose.yml -f compose.override.yml port "$PG_SERVICE" 5432 || true)
+          if [ -z "$MAPPING" ]; then
+            echo "No host mapping for port 5432 found; assuming 5432"
+            echo "HOST_PORT=5432" >> $GITHUB_ENV
+          else
+            HOST_PORT=$(echo "$MAPPING" | awk -F: '{print $NF}')
+            echo "Detected host port: $HOST_PORT"
+            echo "HOST_PORT=$HOST_PORT" >> $GITHUB_ENV
+          fi
+
+      - name: Install `psql` client on runner
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Test login from runner using `psql`
+        env:
+          PGPASSWORD: ${{ secrets.DUMMY || '' }}
+        run: |
+          set -o allexport
+          source ./.postgres.env.example || true
+          set +o allexport
+          export PGPASSWORD="$POSTGRES_PASSWORD"
+          PORT=${HOST_PORT:-5432}
+          echo "Testing connection from runner to localhost:${PORT} as $POSTGRES_USER@$POSTGRES_DB (Postgres ${matrix.pg_version})"
+          psql -h localhost -p ${PORT} -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "\conninfo"
+
+          psql -h localhost -p ${PORT} -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CREATE TABLE IF NOT EXISTS ci_test(id serial primary key, val text);"
+          psql -h localhost -p ${PORT} -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "INSERT INTO ci_test(val) VALUES ('ok') RETURNING id;"
+          psql -h localhost -p ${PORT} -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT val FROM ci_test ORDER BY id DESC LIMIT 1;"
+
+      - name: Tear down
+        if: always()
+        run: |
+          docker compose -f docker-compose.yml -f compose.override.yml down --remove-orphans --volumes
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Copy env file for Docker Compose
+        run: cp postgres.env.example ./.postgres.env.example
+
+      - name: Start services with Docker Compose
+        uses: docker/compose-action@v2
+        with:
+          compose-file: docker-compose.yml
+          action: up
+          detach: true
+
+      - name: Detect Postgres service
+        id: detect_service
+        run: |
+          set -o allexport
+          source ./.postgres.env.example || true
+          set +o allexport
+
+          # Prefer environment override, else default to 'Postgres'
+          PG_SERVICE="${PG_SERVICE:-Postgres}"
+
+          # If the default service exists, use it
+          if [ -n "$(docker compose ps -q "$PG_SERVICE")" ]; then
+            echo "Using configured service: $PG_SERVICE"
+            echo "PG_SERVICE=$PG_SERVICE" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          # Auto-detect: try each service for pg_isready
+          for s in $(docker compose ps --services); do
+            echo "Probing service: $s"
+            if docker compose exec -T "$s" pg_isready -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-postgres}" >/dev/null 2>&1; then
+              PG_SERVICE="$s"
+              echo "Auto-detected Postgres service: $PG_SERVICE"
+              echo "PG_SERVICE=$PG_SERVICE" >> $GITHUB_ENV
+              exit 0
+            fi
+          done
+
+          echo "Could not detect a Postgres service via docker compose." >&2
+          docker compose ps || true
+          exit 1
+
+      - name: Wait for Postgres readiness
+        run: |
+          set -o allexport
+          source ./.postgres.env.example || true
+          set +o allexport
+          echo "Waiting for Postgres (service: $PG_SERVICE) to be ready..."
+          for i in $(seq 1 60); do
+            if docker compose exec -T "$PG_SERVICE" pg_isready -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-postgres}" >/dev/null 2>&1; then
+              echo "Postgres is ready (attempt $i)."
+              exit 0
+            fi
+            echo "Not ready yet (attempt $i)..."
+            sleep 2
+          done
+          echo "Postgres did not become ready in time." >&2
+          docker compose logs "$PG_SERVICE" || true
+          exit 1
+
+      - name: Detect host port for Postgres
+        run: |
+          # docker compose port outputs host:port or a blank line if not published
+          MAPPING=$(docker compose port "$PG_SERVICE" 5432 || true)
+          if [ -z "$MAPPING" ]; then
+            echo "No host mapping for port 5432 found; assuming 5432"
+            echo "HOST_PORT=5432" >> $GITHUB_ENV
+          else
+            # extract the final colon-separated part (the host port)
+            HOST_PORT=$(echo "$MAPPING" | awk -F: '{print $NF}')
+            echo "Detected host port: $HOST_PORT"
+            echo "HOST_PORT=$HOST_PORT" >> $GITHUB_ENV
+          fi
+
+      - name: Install `psql` client on runner
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Test login from runner using `psql`
+        env:
+          PGPASSWORD: ${{ secrets.DUMMY || '' }}
+        run: |
+          set -o allexport
+          source ./.postgres.env.example || true
+          set +o allexport
+          # Use detected host port (from previous step)
+          export PGPASSWORD="$POSTGRES_PASSWORD"
+          PORT=${HOST_PORT:-5432}
+          echo "Testing connection from runner to localhost:${PORT} as $POSTGRES_USER@$POSTGRES_DB"
+          psql -h localhost -p ${PORT} -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "\conninfo"
+
+          # Run a small test query to verify DB operations
+          psql -h localhost -p ${PORT} -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CREATE TABLE IF NOT EXISTS ci_test(id serial primary key, val text);"
+          psql -h localhost -p ${PORT} -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "INSERT INTO ci_test(val) VALUES ('ok') RETURNING id;"
+          psql -h localhost -p ${PORT} -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT val FROM ci_test ORDER BY id DESC LIMIT 1;"
+
+      - name: Tear down
+        if: always()
+        uses: docker/compose-action@v2
+        with:
+          compose-file: docker-compose.yml
+          action: down
+          remove-orphans: true
+          remove-volumes: true

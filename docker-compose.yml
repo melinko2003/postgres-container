@@ -1,0 +1,17 @@
+---
+services:
+  Postgres:
+    image: postgres:16                    # pick your desired version
+    restart: always
+    env_file:
+      - ./.postgres.env.example
+    ports:
+      - "5432:5432"                        # map PostgreSQL port
+    volumes:
+      - ./pg_data:/var/lib/postgresql/data   # persist data
+      - ./init-scripts:/docker-entrypoint-initdb.d  # uncomment to run init scripts
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ExampleUser -d ExampleDb"]  # ensure DB is ready
+      interval: 10s
+      timeout: 5s
+      retries: 5
